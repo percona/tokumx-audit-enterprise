@@ -391,8 +391,8 @@ namespace audit {
         BSONObjBuilder builder;
         builder.append(AUDIT_TYPE, "Create Database");
         printClientInfo(builder, client);
-        builder.append("Index", indexname);
-        builder.append("Namespace", nsname);
+        builder.append("index", indexname);
+        builder.append(NAMESPACE, nsname);
         logger->append(builder.obj());
     }
 
