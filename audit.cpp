@@ -21,6 +21,7 @@
 #include "mongo/db/matcher.h"
 #include "mongo/db/namespacestring.h"
 #include "mongo/util/file.h"
+#include "mongo/util/log.h"
 
 #include <stdio.h>
 
@@ -35,7 +36,7 @@ namespace audit {
 
     //-------------------- CUT HERE -----------------------
 
-    class Log {
+    class Log : public AuditLog {
     public:
         virtual void append(const BSONObj & obj) {};
         virtual ~Log() {};
@@ -133,6 +134,8 @@ namespace audit {
             // TODO: It isnt always invalid bson..
             return Status(ErrorCodes::InvalidBSON, s);
         }
+
+        setAuditLog(logger.get());
 
         return Status::OK();
     }
