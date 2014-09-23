@@ -100,6 +100,14 @@ namespace audit {
 
     static shared_ptr<Log> logger = shared_ptr<Log>(new Log);
 
+    bool commandLineArgumentsSet() {
+        if (cmdLine.auditDestination == "" || cmdLine.auditFormat == "") {
+            return false;
+        }
+
+        return true;
+    }
+
     bool commandLineArgumentsValid() {
         // Extra error checking...
         if (cmdLine.auditDestination != "file") {
@@ -118,6 +126,10 @@ namespace audit {
     }
 
     Status initialize() {
+        if (commandLineArgumentsSet() == false) {
+            return Status::OK();
+        }
+
         try {
             log() << "Initializing audit..." << endl;
             if (!commandLineArgumentsValid()) {
