@@ -135,7 +135,7 @@ namespace audit {
 
     namespace AuditFields {
         BSONField<StringData> type("atype");
-        BSONField<Date_t> timestamp("ts");
+        BSONField<StringData> timestamp("ts");
         BSONField<StringData> ns("ns");
         BSONField<ErrorCodes::Error> result("result");
         BSONField<StringData> users("users");
@@ -147,7 +147,7 @@ namespace audit {
                                  const StringData &atype,
                                  ClientBasic* client) {
         builder << AuditFields::type(atype);
-        builder << AuditFields::timestamp(jsTime());
+        builder << AuditFields::timestamp(terseCurrentTime());
 
         if (client->hasRemote()) {
             builder.append("HostAndPort", client->getRemote().toString());
@@ -160,7 +160,7 @@ namespace audit {
             PrincipalSet::NameIterator nameIter = manager->getAuthenticatedPrincipalNames();
             BSONArrayBuilder allUsers(builder.subarrayStart(AuditFields::users()));
             for ( ; nameIter.more(); nameIter.next()) {
-                allUsers.append(AuthorizationManager::USER_NAME_FIELD_NAME, nameIter->getUser());
+                allUsers.append(nameIter->getUser());
             }
 
             allUsers.doneFast();
@@ -169,7 +169,7 @@ namespace audit {
             PrincipalSet::NameIterator dbIter = manager->getAuthenticatedPrincipalNames();
             BSONArrayBuilder allDBs(builder.subarrayStart(AuditFields::dbs()));
             for ( ; dbIter.more(); dbIter.next()) {
-                allDBs.append(AuthorizationManager::USER_SOURCE_FIELD_NAME, dbIter->getDB());
+                allDBs.append(dbIter->getDB());
             }
 
             allDBs.doneFast();
@@ -184,6 +184,7 @@ namespace audit {
         appendCommonInfo(builder, "authentication", client);
         builder.append("mechanism", mechanism);
         builder.append("user", user);
+        builder << AuditFields::result(result);
         logger->append(builder.done());
     }
 
