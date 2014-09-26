@@ -15,23 +15,24 @@
 #include "mongo/util/concurrency/simplerwlock.h"
 #include "mongo/util/file.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/sock.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace audit {
 
     // Writable interface for audit events
-    class Log : public AuditLog {
+    class WritableAuditLog : public AuditLog {
     public:
-        virtual ~Log() {};
-        virtual void append(const BSONObj & obj) = 0;
+        virtual ~WritableAuditLog() {};
+        virtual void append(const BSONObj &obj) = 0;
         virtual void rotate() = 0;
     };
 
     // Writes audit events to a json file
-    class FileLog : public Log {
+    class JSONAuditLog : public WritableAuditLog {
     public:
-        FileLog(const std::string & file, const BSONObj & filter)
+        JSONAuditLog(const std::string &file, const BSONObj &filter)
             : _file(new File), 
               _matcher(filter.getOwned()), 
               _fileName(file),
@@ -39,9 +40,9 @@ namespace audit {
             _file->open(file.c_str(), false, false);
         };
 
-        virtual void append(const BSONObj & obj) {
+        virtual void append(const BSONObj &obj) {
             if (_matcher.matches(obj)) {
-                std::string str = obj.str();
+                const std::string str = obj.str();
                 SimpleRWLock::Shared lck(_rwLock);
                 _file->write(_file->len(), str.c_str(), str.size());
                 _file->write(_file->len(), "\n", 1);
@@ -75,12 +76,26 @@ namespace audit {
 
     private:
         scoped_ptr<File> _file;
-        Matcher _matcher;
-        std::string _fileName;
+        const Matcher _matcher;
+        const std::string _fileName;
         SimpleRWLock _rwLock;
     };
 
-    static shared_ptr<Log> logger;
+    // Opens an audit log writes to the void - no logging action is taken
+    // other than doing a simple sanity check on the obj to see that it
+    // is non-empty and iterable.
+    // empty and is iterable.
+    class VoidAuditLog : public WritableAuditLog {
+    public:
+        void append(const BSONObj &obj) {
+            verify(!obj.str().empty());
+        }
+
+        void rotate() { }
+    };
+
+    // A null logger means audit is not enabled.
+    static shared_ptr<WritableAuditLog> logger;
 
     bool commandLineArgumentsSet() {
         if (cmdLine.auditDestination == "" || cmdLine.auditFormat == "") {
@@ -104,6 +119,13 @@ namespace audit {
 
     Status initialize() {
         if (!commandLineArgumentsSet()) {
+            // Write audit events into the void for debug builds, so we get
+            // coverage on the code that generates audit log objects.
+            DEV {
+                log() << "Initializing dev null audit log..." << endl;
+                logger.reset(new VoidAuditLog()); 
+                setAuditLog(logger.get());
+            }
             return Status::OK();
         }
 
@@ -111,16 +133,16 @@ namespace audit {
             log() << "Initializing audit..." << endl;
             if (!commandLineArgumentsValid()) {
                 // TODO: Return Status from above check, with specific failures.
-                return Status(ErrorCodes::BadValue, "Invalid Audit Command Line Arguments.");
+                return Status(ErrorCodes::BadValue, "Invalid audit command line arguments.");
             }
 
             const BSONObj filter = fromjson(cmdLine.auditFilter);            
-            logger.reset(new FileLog(cmdLine.auditPath, filter));
+            logger.reset(new JSONAuditLog(cmdLine.auditPath, filter));
             setAuditLog(logger.get());
             return Status::OK();
         }
         catch (const std::exception &ex) {
-            log() << "Audit Filter Error:" << ex.what() << endl;
+            log() << "Audit filter error:" << ex.what() << endl;
             const std::string s = str::stream() << "Audit initialization error: " << ex.what(); 
             // TODO: It isnt always invalid bson..
             return Status(ErrorCodes::InvalidBSON, s);
@@ -128,61 +150,91 @@ namespace audit {
     }
 
     namespace AuditFields {
+        // Common fields
         BSONField<StringData> type("atype");
-        BSONField<StringData> timestamp("ts");
-        BSONField<StringData> ns("ns");
-        BSONField<ErrorCodes::Error> result("result");
-        BSONField<StringData> users("users");
-        BSONField<StringData> dbs("dbs");
-        BSONField<BSONObj> filter("filter");
+        BSONField<BSONObj> timestamp("ts");
+        BSONField<BSONObj> local("local");
+        BSONField<BSONObj> remote("remote");
+        BSONField<BSONObj> params("params");
+        BSONField<int> result("result");
+    }
+
+    // This exists because NamespaceString::toString() prints "admin."
+    // when dbname == "admin" and coll == "", which isn't so great.
+    static std::string nssToString(const NamespaceString &nss) {
+        stringstream ss;
+        if (!nss.db.empty()) {
+            ss << nss.db;
+        }
+        if (!nss.coll.empty()) {
+            ss << '.' << nss.coll;
+        }
+        return ss.str();
     }
 
     static void appendCommonInfo(BSONObjBuilder &builder,
                                  const StringData &atype,
                                  ClientBasic* client) {
         builder << AuditFields::type(atype);
-        builder << AuditFields::timestamp(terseCurrentTime());
-
+        builder << AuditFields::timestamp(BSON("$date" << jsTime()));
+        builder << AuditFields::local(BSON("host" << getHostNameCached() << "port" << cmdLine.port));
         if (client->hasRemote()) {
-            builder.append("HostAndPort", client->getRemote().toString());
+            const HostAndPort hp = client->getRemote();
+            builder << AuditFields::remote(BSON("host" << hp.host() << "port" << hp.port()));
+        } else {
+            // It's not 100% clear that an empty obj here actually makes sense..
+            builder << AuditFields::remote(BSONObj());
         }
-
         if (client->hasAuthorizationManager()) {
-            AuthorizationManager * manager = client->getAuthorizationManager();
-
-            // First get the user name array.
-            PrincipalSet::NameIterator nameIter = manager->getAuthenticatedPrincipalNames();
-            BSONArrayBuilder allUsers(builder.subarrayStart(AuditFields::users()));
-            for ( ; nameIter.more(); nameIter.next()) {
-                allUsers.append(nameIter->getUser());
+            // Build the users array, which consists of (user, db) pairs
+            AuthorizationManager *manager = client->getAuthorizationManager();
+            BSONArrayBuilder users(builder.subarrayStart("users"));
+            for (PrincipalSet::NameIterator it = manager->getAuthenticatedPrincipalNames();
+                 it.more(); it.next()) {
+                users.append(BSON("user" << it->getUser() << "db" << it->getDB()));
             }
-
-            allUsers.doneFast();
-
-            // Now get the db name array.
-            PrincipalSet::NameIterator dbIter = manager->getAuthenticatedPrincipalNames();
-            BSONArrayBuilder allDBs(builder.subarrayStart(AuditFields::dbs()));
-            for ( ; dbIter.more(); dbIter.next()) {
-                allDBs.append(dbIter->getDB());
-            }
-
-            allDBs.doneFast();
+            users.doneFast();
+        } else {
+            // It's not 100% clear that an empty obj here actually makes sense..
+            builder << "users" << BSONObj();
         }
     }
 
+    static void _auditEvent(ClientBasic* client,
+                            const StringData& atype,
+                            const BSONObj& params,
+                            ErrorCodes::Error result = ErrorCodes::OK) {
+        BSONObjBuilder builder;
+        appendCommonInfo(builder, atype, client);
+        builder << AuditFields::params(params);
+        builder << AuditFields::result(static_cast<int>(result));
+        logger->append(builder.done());
+    }
+
+    static void _auditAuthzFailure(ClientBasic* client,
+                                 const StringData& ns,
+                                 const StringData& command,
+                                 const BSONObj& args,
+                                 ErrorCodes::Error result) {
+        const BSONObj params = !ns.empty() ?
+            BSON("command" << command << "ns" << ns << "args" << args) :
+            BSON("command" << command << "args" << args);
+        _auditEvent(client, "authCheck", params, result);
+    }
+
     void logAuthentication(ClientBasic* client,
+                           const StringData& dbname,
                            const StringData& mechanism,
                            const std::string& user,
                            ErrorCodes::Error result) {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "authentication", client);
-        builder.append("mechanism", mechanism);
-        builder.append("user", user);
-        builder << AuditFields::result(result);
-        logger->append(builder.done());
+
+        const BSONObj params = BSON("user" << user <<
+                                    "db" << dbname <<
+                                    "mechanism" << mechanism);
+        _auditEvent(client, "authenticate", params, result);
     }
 
     void logCommandAuthzCheck(ClientBasic* client,
@@ -192,11 +244,10 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "commandAuthzCheck", client);
-        builder << AuditFields::ns(ns.toString());
-        builder << AuditFields::result(result);
-        logger->append(builder.done());
+
+        if (result != ErrorCodes::OK) {
+            _auditAuthzFailure(client, nssToString(ns), cmdObj.firstElement().fieldName(), cmdObj, result);
+        }
     }
 
     void logDeleteAuthzCheck(
@@ -207,12 +258,10 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "deleteAuthzCheck", client);
-        builder << AuditFields::ns(ns.toString());
-        builder.append("pattern", pattern);
-        builder << AuditFields::result(result);
-        logger->append(builder.done());
+
+        if (result != ErrorCodes::OK) {
+            _auditAuthzFailure(client, nssToString(ns), "delete", BSON("pattern" << pattern), result);
+        }
     }
 
     void logGetMoreAuthzCheck(
@@ -223,12 +272,10 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "getMoreAuthzCheck", client);
-        builder << AuditFields::ns(ns.toString());
-        builder.append("cursor_id", cursorId);
-        builder << AuditFields::result(result);
-        logger->append(builder.done());
+
+        if (result != ErrorCodes::OK) {
+            _auditAuthzFailure(client, nssToString(ns), "getMore", BSON("cursorId" << cursorId), result);
+        }
     }
 
     void logInProgAuthzCheck(
@@ -238,11 +285,10 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "inProgAuthzCheck", client);
-        builder << AuditFields::filter(filter);
-        builder << AuditFields::result(result);
-        logger->append(builder.done());
+
+        if (result != ErrorCodes::OK) {
+            _auditAuthzFailure(client, "", "inProg", BSON("filter" << filter), result);
+        }
     }
 
     void logInsertAuthzCheck(
@@ -253,12 +299,10 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "insertAuthzCheck", client);
-        builder << AuditFields::ns(ns.toString());
-        builder.append("obj", insertedObj); 
-        builder << AuditFields::result(result);
-        logger->append(builder.done());
+
+        if (result != ErrorCodes::OK) {
+            _auditAuthzFailure(client, nssToString(ns), "insert", BSON("obj" << insertedObj), result);
+        }
     }
 
     void logKillCursorsAuthzCheck(
@@ -269,12 +313,10 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "killCursorsAuthzCheck", client);
-        builder << AuditFields::ns(ns.toString());
-        builder.append("cursor_id", cursorId);
-        builder << AuditFields::result(result);
-        logger->append(builder.done());
+
+        if (result != ErrorCodes::OK) {
+            _auditAuthzFailure(client, nssToString(ns), "killCursors", BSON("cursorId" << cursorId), result);
+        }
     }
 
     void logKillOpAuthzCheck(
@@ -284,11 +326,10 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "killOpAuthzCheck", client);
-        builder << AuditFields::filter(filter);
-        builder << AuditFields::result(result);
-        logger->append(builder.done());
+
+        if (result != ErrorCodes::OK) {
+            _auditAuthzFailure(client, "", "killOp", BSON("filter" << filter), result);
+        }
     }
 
     void logQueryAuthzCheck(
@@ -299,15 +340,9 @@ namespace audit {
         if (!logger) {
             return;
         }
-        // HACK: This is to avoid printing internal "Client"
-        // heartbeat queries.
-        if (client->hasRemote()) {
-            BSONObjBuilder builder;
-            appendCommonInfo(builder, "queryAuthCheck", client);
-            builder << AuditFields::ns(ns.toString());
-            builder.append("query", query);
-            builder << AuditFields::result(result);
-            logger->append(builder.done());
+
+        if (result != ErrorCodes::OK) {
+            _auditAuthzFailure(client, nssToString(ns), "query", BSON("query" << query), result);
         }
     }
 
@@ -322,14 +357,13 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "updateAuthzCheck", client);
-        builder << AuditFields::ns(ns.toString());
-        builder.append("query", query);
-        builder.append("upsert", isUpsert);
-        builder.append("multi", isMulti);
-        builder << AuditFields::result(result);
-        logger->append(builder.done());
+
+        if (result != ErrorCodes::OK) {
+            const BSONObj args = BSON("pattern" << query <<
+                                      "upsert" << isUpsert <<
+                                      "multi" << isMulti); 
+            _auditAuthzFailure(client, nssToString(ns), "update", args, result);
+        }
     }
 
     void logReplSetReconfig(ClientBasic* client,
@@ -338,11 +372,9 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "replSetReconfig", client);
-        builder.append("old_config", oldConfig);
-        builder.append("new_config", newConfig);
-        logger->append(builder.done());
+
+        const BSONObj params = BSON("old" << oldConfig << "new" << newConfig);
+        _auditEvent(client, "replSetReconfig", params);
     }
 
     void logApplicationMessage(ClientBasic* client,
@@ -350,30 +382,18 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "applicationMessage", client);
-        builder.append("message", msg);
-        logger->append(builder.done());
+
+        const BSONObj params = BSON("msg" << msg);
+        _auditEvent(client, "applicationMessage", params);
     }
 
     void logShutdown(ClientBasic* client) {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "shutdown", client);
-        logger->append(builder.done());
-    }
 
-    void logAuditLogRotate(ClientBasic* client,
-                           const StringData& file) {
-        if (!logger) {
-            return;
-        }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "rotateAuditLog", client);
-        builder.append("file", file);
-        logger->append(builder.done());
+        const BSONObj params = BSONObj();
+        _auditEvent(client, "shutdown", params);
     }
 
     void logCreateIndex(ClientBasic* client,
@@ -383,12 +403,11 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "createIndex", client);
-        builder.append("index_spec", indexSpec);
-        builder.append("index_name", indexname);
-        builder << AuditFields::ns(nsname);
-        logger->append(builder.done());
+
+        const BSONObj params = BSON("ns" << nsname <<
+                                    "indexName" << indexname <<
+                                    "indexSpec" << indexSpec);
+        _auditEvent(client, "createIndex", params);
     }
 
     void logCreateCollection(ClientBasic* client,
@@ -396,10 +415,9 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "createCollection", client);
-        builder << AuditFields::ns(nsname);
-        logger->append(builder.done());
+
+        const BSONObj params = BSON("ns" << nsname);
+        _auditEvent(client, "createCollection", params);
     }
 
     void logCreateDatabase(ClientBasic* client,
@@ -407,10 +425,9 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "createDatabase", client);
-        builder << AuditFields::ns(nsname);
-        logger->append(builder.done());
+
+        const BSONObj params = BSON("ns" << nsname);
+        _auditEvent(client, "createDatabase", params);
     }
 
     void logDropIndex(ClientBasic* client,
@@ -419,11 +436,9 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "dropIndex",  client);
-        builder.append("index", indexname);
-        builder << AuditFields::ns(nsname);
-        logger->append(builder.done());
+
+        const BSONObj params = BSON("ns" << nsname << "indexName" << indexname);
+        _auditEvent(client, "dropIndex", params);
     }
 
     void logDropCollection(ClientBasic* client,
@@ -431,10 +446,9 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "dropCollection", client);
-        builder << AuditFields::ns(nsname);
-        logger->append(builder.done());
+
+        const BSONObj params = BSON("ns" << nsname);
+        _auditEvent(client, "dropCollection", params);
     }
 
     void logDropDatabase(ClientBasic* client,
@@ -442,10 +456,9 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "dropDatabase", client);
-        builder << AuditFields::ns(nsname);
-        logger->append(builder.done());
+
+        const BSONObj params = BSON("ns" << nsname);
+        _auditEvent(client, "dropDatabase", params);
     }
 
     void logRenameCollection(ClientBasic* client,
@@ -454,11 +467,9 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "renameCollection", client);
-        builder.append("source", source);
-        builder.append("target", target);
-        logger->append(builder.done());
+
+        const BSONObj params = BSON("old" << source << "new" << target);
+        _auditEvent(client, "renameCollection", params);
     }
 
     void logEnableSharding(ClientBasic* client,
@@ -466,10 +477,9 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "enableSharding", client);
-        builder << AuditFields::ns(nsname); 
-        logger->append(builder.done());
+
+        const BSONObj params = BSON("ns" << nsname);
+        _auditEvent(client, "enableSharding", params);
     }
 
     void logAddShard(ClientBasic* client,
@@ -479,12 +489,11 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "addShard", client);
-        builder.append("name", name);
-        builder.append("servers", servers);
-        builder.append("max_size", maxsize);
-        logger->append(builder.done());
+
+        const BSONObj params= BSON("shard" << name <<
+                                   "connectionString" << servers <<
+                                   "maxSize" << maxsize);
+        _auditEvent(client, "addShard", params);
     }
 
     void logRemoveShard(ClientBasic* client,
@@ -492,10 +501,9 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "removeShard", client);
-        builder.append("shard_name", shardname);
-        logger->append(builder.done());
+
+        const BSONObj params = BSON("shard" << shardname);
+        _auditEvent(client, "removeShard", params);
     }
 
     void logShardCollection(ClientBasic* client,
@@ -505,11 +513,11 @@ namespace audit {
         if (!logger) {
             return;
         }
-        BSONObjBuilder builder;
-        appendCommonInfo(builder, "shardCollection", client);
-        builder << AuditFields::ns(ns);
-        builder.append("key_pattern", keyPattern);
-        logger->append(builder.done());
+
+        const BSONObj params = BSON("ns" << ns <<
+                                    "key" << keyPattern <<
+                                    "options" << BSON("unique" << unique));
+        _auditEvent(client, "shardCollection", params);
     }
 
 }  // namespace audit
