@@ -19,7 +19,72 @@
 #include "mongo/util/time_support.h"
 
 namespace mongo {
+
 namespace audit {
+
+    static struct AuditOptions {
+        // Output format, 'eg JSON'
+        std::string format;
+
+        // Destination path, eg '/data/db/audit.json'
+        std::string path;
+
+        // Destination style, eg 'file'
+        std::string destination;
+
+        // Filter query for audit events.
+        // eg "{ atype: { $in: [ 'authenticate', 'dropDatabase' ] } }"
+        std::string filter;
+
+        AuditOptions() :
+            format("JSON"),
+            path("auditLog.json"),
+            destination("file"),
+            filter("{}") {
+        }
+
+        Status initializeFromCommandLine() {
+            if (cmdLine.auditFormat != "") {
+                if (cmdLine.auditFormat != "JSON") {
+                    return Status(ErrorCodes::BadValue,
+                                  "The only audit format currently supported is `JSON'");
+                }
+                format = cmdLine.auditFormat;
+            }
+
+            if (cmdLine.auditPath != "") {
+                File auditFile;
+                auditFile.open(cmdLine.auditPath.c_str(), false, false);
+                if (auditFile.bad()) {
+                    return Status(ErrorCodes::BadValue,
+                                  "Could not open a file for writing at the given auditPath: "
+                                  + cmdLine.auditPath);
+                }
+                path = cmdLine.auditPath;
+            }
+
+            if (cmdLine.auditDestination != "") {
+                if (cmdLine.auditDestination != "file") {
+                    return Status(ErrorCodes::BadValue,
+                                  "The only audit destination currently supported is `file'");
+                }
+                destination = cmdLine.auditDestination;
+            }
+
+            if (cmdLine.auditFilter != "") {
+                try {
+                    fromjson(cmdLine.auditFilter);
+                } catch (const std::exception &ex) {
+                    return Status(ErrorCodes::BadValue,
+                                  "Could not parse audit filter into valid json: "
+                                  + cmdLine.auditFilter);
+                }
+                filter = cmdLine.auditFilter;
+            }
+
+            return Status::OK();
+        }
+    } _auditOptions;
 
     // Writable interface for audit events
     class WritableAuditLog : public AuditLog {
@@ -63,10 +128,9 @@ namespace audit {
             std::string s = ss.str();
             int r = std::rename(_fileName.c_str(), s.c_str());
             if (r != 0) {
-                error() << "Could not rotate audit log:" 
-                        << errnoWithDescription()
+                error() << "Could not rotate audit log, but continuing normally "
+                        << "(error desc: " << errnoWithDescription() << ")"
                         << endl;
-                return;
             }
 
             // Open a new file, with the same name as the original.
@@ -94,59 +158,40 @@ namespace audit {
         void rotate() { }
     };
 
-    // A null logger means audit is not enabled.
-    static shared_ptr<WritableAuditLog> logger;
+    static shared_ptr<WritableAuditLog> _auditLog;
 
-    bool commandLineArgumentsSet() {
-        if (cmdLine.auditDestination == "" || cmdLine.auditFormat == "") {
-            return false;
-        }
+    static void _setGlobalAuditLog(WritableAuditLog *log) {
+        _auditLog.reset(log);
 
-        return true;
+        // Sets the audit log in the general logging framework which
+        // will rotate() the audit log when the server log rotates.
+        setAuditLog(log);
     }
 
-    bool commandLineArgumentsValid() {
-        if (cmdLine.auditDestination != "file") {
-            return false;
-        }
-        
-        if (cmdLine.auditFormat != "JSON") {
-            return false;
-        }
-
-        return true;
+    static bool _auditEnabledOnCommandLine() {
+        return cmdLine.auditDestination != "";
     }
-
+    
     Status initialize() {
-        if (!commandLineArgumentsSet()) {
+        if (!_auditEnabledOnCommandLine()) {
             // Write audit events into the void for debug builds, so we get
             // coverage on the code that generates audit log objects.
             DEV {
-                log() << "Initializing dev null audit log..." << endl;
-                logger.reset(new VoidAuditLog()); 
-                setAuditLog(logger.get());
+                log() << "Initializing dev null audit..." << endl;
+                _setGlobalAuditLog(new VoidAuditLog());
             }
             return Status::OK();
         }
 
-        try {
-            log() << "Initializing audit..." << endl;
-            if (!commandLineArgumentsValid()) {
-                // TODO: Return Status from above check, with specific failures.
-                return Status(ErrorCodes::BadValue, "Invalid audit command line arguments.");
-            }
+        log() << "Initializing audit..." << endl;
+        Status s = _auditOptions.initializeFromCommandLine();
+        if (!s.isOK()) {
+            return s;
+        }
 
-            const BSONObj filter = fromjson(cmdLine.auditFilter);            
-            logger.reset(new JSONAuditLog(cmdLine.auditPath, filter));
-            setAuditLog(logger.get());
-            return Status::OK();
-        }
-        catch (const std::exception &ex) {
-            log() << "Audit filter error:" << ex.what() << endl;
-            const std::string s = str::stream() << "Audit initialization error: " << ex.what(); 
-            // TODO: It isnt always invalid bson..
-            return Status(ErrorCodes::InvalidBSON, s);
-        }
+        const BSONObj filter = fromjson(_auditOptions.filter);            
+        _setGlobalAuditLog(new JSONAuditLog(_auditOptions.path, filter));
+        return Status::OK();
     }
 
     namespace AuditFields {
@@ -208,7 +253,7 @@ namespace audit {
         appendCommonInfo(builder, atype, client);
         builder << AuditFields::params(params);
         builder << AuditFields::result(static_cast<int>(result));
-        logger->append(builder.done());
+        _auditLog->append(builder.done());
     }
 
     static void _auditAuthzFailure(ClientBasic* client,
@@ -227,7 +272,7 @@ namespace audit {
                            const StringData& mechanism,
                            const std::string& user,
                            ErrorCodes::Error result) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -241,7 +286,7 @@ namespace audit {
                               const NamespaceString& ns,
                               const BSONObj& cmdObj,
                               ErrorCodes::Error result) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -255,7 +300,7 @@ namespace audit {
             const NamespaceString& ns,
             const BSONObj& pattern,
             ErrorCodes::Error result) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -269,7 +314,7 @@ namespace audit {
             const NamespaceString& ns,
             long long cursorId,
             ErrorCodes::Error result) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -282,7 +327,7 @@ namespace audit {
             ClientBasic* client,
             const BSONObj& filter,
             ErrorCodes::Error result) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -296,7 +341,7 @@ namespace audit {
             const NamespaceString& ns,
             const BSONObj& insertedObj,
             ErrorCodes::Error result) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -310,7 +355,7 @@ namespace audit {
             const NamespaceString& ns,
             long long cursorId,
             ErrorCodes::Error result) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -323,7 +368,7 @@ namespace audit {
             ClientBasic* client,
             const BSONObj& filter,
             ErrorCodes::Error result) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -337,7 +382,7 @@ namespace audit {
             const NamespaceString& ns,
             const BSONObj& query,
             ErrorCodes::Error result) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -354,7 +399,7 @@ namespace audit {
             bool isUpsert,
             bool isMulti,
             ErrorCodes::Error result) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -369,7 +414,7 @@ namespace audit {
     void logReplSetReconfig(ClientBasic* client,
                             const BSONObj* oldConfig,
                             const BSONObj* newConfig) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -379,7 +424,7 @@ namespace audit {
 
     void logApplicationMessage(ClientBasic* client,
                                const StringData& msg) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -388,7 +433,7 @@ namespace audit {
     }
 
     void logShutdown(ClientBasic* client) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -400,7 +445,7 @@ namespace audit {
                         const BSONObj* indexSpec,
                         const StringData& indexname,
                         const StringData& nsname) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -412,7 +457,7 @@ namespace audit {
 
     void logCreateCollection(ClientBasic* client,
                              const StringData& nsname) { 
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -422,7 +467,7 @@ namespace audit {
 
     void logCreateDatabase(ClientBasic* client,
                            const StringData& nsname) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -433,7 +478,7 @@ namespace audit {
     void logDropIndex(ClientBasic* client,
                       const StringData& indexname,
                       const StringData& nsname) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -443,7 +488,7 @@ namespace audit {
 
     void logDropCollection(ClientBasic* client,
                            const StringData& nsname) { 
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -453,7 +498,7 @@ namespace audit {
 
     void logDropDatabase(ClientBasic* client,
                          const StringData& nsname) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -464,7 +509,7 @@ namespace audit {
     void logRenameCollection(ClientBasic* client,
                              const StringData& source,
                              const StringData& target) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -474,7 +519,7 @@ namespace audit {
 
     void logEnableSharding(ClientBasic* client,
                            const StringData& nsname) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -486,7 +531,7 @@ namespace audit {
                      const StringData& name,
                      const std::string& servers,
                      long long maxsize) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -498,7 +543,7 @@ namespace audit {
 
     void logRemoveShard(ClientBasic* client,
                         const StringData& shardname) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -510,7 +555,7 @@ namespace audit {
                             const StringData& ns,
                             const BSONObj& keyPattern,
                             bool unique) {
-        if (!logger) {
+        if (!_auditLog) {
             return;
         }
 
@@ -521,5 +566,5 @@ namespace audit {
     }
 
 }  // namespace audit
-}  // namespace mongo
 
+}  // namespace mongo
