@@ -221,7 +221,7 @@ namespace audit {
                                  const StringData &atype,
                                  ClientBasic* client) {
         builder << AuditFields::type(atype);
-        builder << AuditFields::timestamp(BSON("$date" << jsTime()));
+        builder << AuditFields::timestamp(BSON("$date" << static_cast<uint64_t>(jsTime())));
         builder << AuditFields::local(BSON("host" << getHostNameCached() << "port" << cmdLine.port));
         if (client->hasRemote()) {
             const HostAndPort hp = client->getRemote();
