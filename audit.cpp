@@ -441,7 +441,7 @@ namespace audit {
 
         const BSONObj params = BSON("ns" << nsname <<
                                     "indexName" << indexname <<
-                                    "indexSpec" << indexSpec);
+                                    "indexSpec" << *indexSpec);
         _auditEvent(client, "createIndex", params);
     }
 
