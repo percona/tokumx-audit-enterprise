@@ -8,6 +8,7 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/client_basic.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher.h"
 #include "mongo/db/namespacestring.h"
@@ -306,6 +307,8 @@ namespace audit {
 
         if (result != ErrorCodes::OK) {
             _auditAuthzFailure(client, nssToString(ns), "delete", BSON("pattern" << pattern), result);
+        } else if (ns.coll == "system.users") {
+            _auditEvent(client, "dropUser", BSON("db" << ns.db << "pattern" << pattern));
         }
     }
 
@@ -347,6 +350,8 @@ namespace audit {
 
         if (result != ErrorCodes::OK) {
             _auditAuthzFailure(client, nssToString(ns), "insert", BSON("obj" << insertedObj), result);
+        } else if (ns.coll == "system.users") {
+            _auditEvent(client, "createUser", BSON("db" << ns.db << "userObj" << insertedObj));
         }
     }
 
@@ -408,6 +413,12 @@ namespace audit {
                                       "upsert" << isUpsert <<
                                       "multi" << isMulti); 
             _auditAuthzFailure(client, nssToString(ns), "update", args, result);
+        } else if (ns.coll == "system.users") {
+            const BSONObj params = BSON("db" << ns.db <<
+                                        "pattern" << query <<
+                                        "upsert" << isUpsert <<
+                                        "multi" << isMulti); 
+            _auditEvent(client, "updateUser", params);
         }
     }
 
@@ -566,5 +577,38 @@ namespace audit {
     }
 
 }  // namespace audit
+
+    // -------------------------------------------------------------------------
+
+    class LogApplicationMessageCommand : public QueryCommand {
+    public:
+        LogApplicationMessageCommand() : QueryCommand("logApplicationMessage") { }
+        virtual ~LogApplicationMessageCommand() { }
+        virtual void help( stringstream &help ) const {
+            help << 
+                "Log a custom application message string to the audit log. Must be a string." << 
+                "Example: { logApplicationMessage: \"it's a trap!\" }";
+        }
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {
+            ActionSet actions;
+            actions.addAction(ActionType::logReplInfo);
+            out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
+        }
+        bool run(const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+            bool ok = true;
+            const BSONElement &e = jsobj["logApplicationMessage"];
+
+            if (e.type() == String) {
+                audit::logApplicationMessage(ClientBasic::getCurrent(), e.Stringdata());
+            } else {
+                errmsg = "logApplicationMessage only accepts string messages";
+                ok = false;
+            }
+            result.append("ok", ok);
+            return ok;
+        }
+    } cmdLogApplicationMessage;
 
 }  // namespace mongo
