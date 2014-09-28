@@ -147,11 +147,10 @@ namespace audit {
         SimpleRWLock _rwLock;
     };
 
-    // Opens an audit log writes to the void - no logging action is taken
-    // other than doing a simple sanity check on the obj to see that it
-    // is non-empty and iterable.
-    // empty and is iterable.
-    // TODO: the above comment is weird
+    // A void audit log does not actually write any audit events. Instead, it
+    // verifies that we can call toString() on the generatd bson obj and that
+    // the result is non-empty. This is useful for sanity testing the audit bson
+    // generation code even when auditing is not explicitly enabled in debug builds.
     class VoidAuditLog : public WritableAuditLog {
     public:
         void append(const BSONObj &obj) {
