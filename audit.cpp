@@ -170,6 +170,9 @@ namespace audit {
                         warning() << "Audit system cannot write event " << obj.str() << " to log file " << _fileName << std::endl;
                         warning() << "Write failed with retryable error " << errnoWithDescription(writeRet) << std::endl;
                         warning() << "Audit system will retry this write another " << retries - 1 << " times." << std::endl;
+                        if (retries <= 7 && retries > 0) {
+                            sleepmillis(1 << ((7 - retries) * 2));
+                        }
                     }
 
                     if (writeRet != 0) {
@@ -194,6 +197,9 @@ namespace audit {
                     warning() << "Audit system cannot fsync event " << obj.str() << " to log file " << _fileName << std::endl;
                     warning() << "Fsync failed with retryable error " << errnoWithDescription(fsyncRet) << std::endl;
                     warning() << "Audit system will retry this fsync another " << retries - 1 << " times." << std::endl;
+                    if (retries <= 7 && retries > 0) {
+                        sleepmillis(1 << ((7 - retries) * 2));
+                    }
                 }
 
                 if (fsyncRet != 0) {
