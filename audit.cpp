@@ -145,9 +145,8 @@ namespace audit {
                     // have to retry.
                     fileofs pos = _file->len();
 
-                    int retries = 10;
                     int writeRet;
-                    while (retries-- > 0) {
+                    for (int retries = 10; retries > 0; --retries) {
                         writeRet = _file->writeReturningError(pos, str.c_str(), str.size());
                         if (writeRet == 0) {
                             break;
@@ -159,7 +158,7 @@ namespace audit {
                         }
                         warning() << "Audit system cannot write event " << obj.str() << " to log file " << _fileName << std::endl;
                         warning() << "Write failed with retryable error " << errnoWithDescription(writeRet) << std::endl;
-                        warning() << "Audit system will retry this write another " << retries << " times." << std::endl;
+                        warning() << "Audit system will retry this write another " << retries - 1 << " times." << std::endl;
                     }
 
                     if (writeRet != 0) {
@@ -170,9 +169,8 @@ namespace audit {
                     }
                 }
 
-                int retries = 10;
                 int fsyncRet;
-                while (retries-- > 0) {
+                for (int retries = 10; retries > 0; --retries) {
                     fsyncRet = _file->fsyncReturningError();
                     if (fsyncRet == 0) {
                         break;
@@ -184,7 +182,7 @@ namespace audit {
                     }
                     warning() << "Audit system cannot fsync event " << obj.str() << " to log file " << _fileName << std::endl;
                     warning() << "Fsync failed with retryable error " << errnoWithDescription(fsyncRet) << std::endl;
-                    warning() << "Audit system will retry this fsync another " << retries << " times." << std::endl;
+                    warning() << "Audit system will retry this fsync another " << retries - 1 << " times." << std::endl;
                 }
 
                 if (fsyncRet != 0) {
