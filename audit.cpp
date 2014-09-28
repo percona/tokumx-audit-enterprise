@@ -89,7 +89,7 @@ namespace audit {
     // Writable interface for audit events
     class WritableAuditLog : public AuditLog {
     public:
-        virtual ~WritableAuditLog() {};
+        virtual ~WritableAuditLog() {}
         virtual void append(const BSONObj &obj) = 0;
         virtual void rotate() = 0;
     };
@@ -103,7 +103,7 @@ namespace audit {
               _fileName(file),
               _rwLock("auditfileRWLock") {
             _file->open(file.c_str(), false, false);
-        };
+        }
 
         virtual void append(const BSONObj &obj) {
             if (_matcher.matches(obj)) {
@@ -111,9 +111,11 @@ namespace audit {
                 SimpleRWLock::Shared lck(_rwLock);
                 _file->write(_file->len(), str.c_str(), str.size());
                 _file->write(_file->len(), "\n", 1);
+                // TODO: mongo::File::fsync() eats any errors.  Consider
+                // std::ostream instead?
                 _file->fsync();
             }
-        };
+        }
 
         virtual void rotate() {
             SimpleRWLock::Exclusive lck(_rwLock);
@@ -145,10 +147,10 @@ namespace audit {
         SimpleRWLock _rwLock;
     };
 
-    // Opens an audit log writes to the void - no logging action is taken
-    // other than doing a simple sanity check on the obj to see that it
-    // is non-empty and iterable.
-    // empty and is iterable.
+    // A void audit log does not actually write any audit events. Instead, it
+    // verifies that we can call toString() on the generatd bson obj and that
+    // the result is non-empty. This is useful for sanity testing the audit bson
+    // generation code even when auditing is not explicitly enabled in debug builds.
     class VoidAuditLog : public WritableAuditLog {
     public:
         void append(const BSONObj &obj) {
@@ -236,7 +238,10 @@ namespace audit {
             BSONArrayBuilder users(builder.subarrayStart("users"));
             for (PrincipalSet::NameIterator it = manager->getAuthenticatedPrincipalNames();
                  it.more(); it.next()) {
-                users.append(BSON("user" << it->getUser() << "db" << it->getDB()));
+                BSONArrayBuilder user(users.subobjStart());
+                user.append("user", it->getUser());
+                user.append("db", it->getDB());
+                user.doneFast();
             }
             users.doneFast();
         } else {
