@@ -92,6 +92,17 @@ namespace audit {
         }
     } _auditOptions;
 
+    NOINLINE_DECL void realexit( ExitCode rc ) {
+#ifdef _COVERAGE
+        // Need to make sure coverage data is properly flushed before exit.
+        // It appears that ::_exit() does not do this.
+        log() << "calling regular ::exit() so coverage data may flush..." << endl;
+        ::exit( rc );
+#else
+        ::_exit( rc );
+#endif
+    }
+
     // Writable interface for audit events
     class WritableAuditLog : public AuditLog {
     public:
@@ -154,7 +165,7 @@ namespace audit {
                             error() << "Audit system cannot write event " << obj.str() << " to log file " << _fileName << std::endl;
                             error() << "Write failed with fatal error " << errnoWithDescription(writeRet) << std::endl;
                             error() << "As audit cannot make progress, the server will now shut down." << std::endl;
-                            dbexit(EXIT_AUDIT_ERROR);
+                            realexit(EXIT_AUDIT_ERROR);
                         }
                         warning() << "Audit system cannot write event " << obj.str() << " to log file " << _fileName << std::endl;
                         warning() << "Write failed with retryable error " << errnoWithDescription(writeRet) << std::endl;
@@ -165,7 +176,7 @@ namespace audit {
                         error() << "Audit system cannot write event " << obj.str() << " to log file " << _fileName << std::endl;
                         error() << "Write failed with fatal error " << errnoWithDescription(writeRet) << std::endl;
                         error() << "As audit cannot make progress, the server will now shut down." << std::endl;
-                        dbexit(EXIT_AUDIT_ERROR);
+                        realexit(EXIT_AUDIT_ERROR);
                     }
                 }
 
@@ -178,7 +189,7 @@ namespace audit {
                         error() << "Audit system cannot fsync event " << obj.str() << " to log file " << _fileName << std::endl;
                         error() << "Fsync failed with fatal error " << errnoWithDescription(fsyncRet) << std::endl;
                         error() << "As audit cannot make progress, the server will now shut down." << std::endl;
-                        dbexit(EXIT_AUDIT_ERROR);
+                        realexit(EXIT_AUDIT_ERROR);
                     }
                     warning() << "Audit system cannot fsync event " << obj.str() << " to log file " << _fileName << std::endl;
                     warning() << "Fsync failed with retryable error " << errnoWithDescription(fsyncRet) << std::endl;
@@ -189,7 +200,7 @@ namespace audit {
                     error() << "Audit system cannot fsync event " << obj.str() << " to log file " << _fileName << std::endl;
                     error() << "Fsync failed with fatal error " << errnoWithDescription(fsyncRet) << std::endl;
                     error() << "As audit cannot make progress, the server will now shut down." << std::endl;
-                    dbexit(EXIT_AUDIT_ERROR);
+                    realexit(EXIT_AUDIT_ERROR);
                 }
             }
         }
