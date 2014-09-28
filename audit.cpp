@@ -427,6 +427,16 @@ namespace audit {
         _auditEvent(client, "replSetReconfig", params);
     }
 
+    void logApplicationMessage(ClientBasic* client,
+                               const StringData& msg) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params = BSON("msg" << msg);
+        _auditEvent(client, "applicationMessage", params);
+    }
+
     void logShutdown(ClientBasic* client) {
         if (!_auditLog) {
             return;
