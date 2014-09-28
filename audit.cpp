@@ -410,12 +410,14 @@ namespace audit {
 
         if (result != ErrorCodes::OK) {
             const BSONObj args = BSON("pattern" << query <<
+                                      "updateObj" << updateObj <<
                                       "upsert" << isUpsert <<
                                       "multi" << isMulti); 
             _auditAuthzFailure(client, nssToString(ns), "update", args, result);
         } else if (ns.coll == "system.users") {
             const BSONObj params = BSON("db" << ns.db <<
                                         "pattern" << query <<
+                                        "updateObj" << updateObj <<
                                         "upsert" << isUpsert <<
                                         "multi" << isMulti); 
             _auditEvent(client, "updateUser", params);
