@@ -161,43 +161,42 @@ namespace audit {
                 // the kernel, the synchronization is still there).  This
                 // is a good enough place as any.
                 //
-                // Note that we don't need the mutex around fsync.
-                {
-                    SimpleMutex::scoped_lock lck(_mutex);
+                // We don't need the mutex around fsync, except to protect against concurrent
+                // logRotate destroying our pointer.  Welp.
+                SimpleMutex::scoped_lock lck(_mutex);
 
-                    // If pwrite performs a partial write, we don't want to
-                    // muck about figuring out how much it did write (hard to
-                    // get out of the File abstraction) and then carefully
-                    // writing the rest.  Easier to calculate the position
-                    // first, then repeatedly write to that position if we
-                    // have to retry.
-                    fileofs pos = _file->len();
+                // If pwrite performs a partial write, we don't want to
+                // muck about figuring out how much it did write (hard to
+                // get out of the File abstraction) and then carefully
+                // writing the rest.  Easier to calculate the position
+                // first, then repeatedly write to that position if we
+                // have to retry.
+                fileofs pos = _file->len();
 
-                    int writeRet;
-                    for (int retries = 10; retries > 0; --retries) {
-                        writeRet = _file->writeReturningError(pos, str.c_str(), str.size());
-                        if (writeRet == 0) {
-                            break;
-                        } else if (!ioErrorShouldRetry(writeRet)) {
-                            error() << "Audit system cannot write event " << obj.str() << " to log file " << _fileName << std::endl;
-                            error() << "Write failed with fatal error " << errnoWithDescription(writeRet) << std::endl;
-                            error() << "As audit cannot make progress, the server will now shut down." << std::endl;
-                            realexit(EXIT_AUDIT_ERROR);
-                        }
-                        warning() << "Audit system cannot write event " << obj.str() << " to log file " << _fileName << std::endl;
-                        warning() << "Write failed with retryable error " << errnoWithDescription(writeRet) << std::endl;
-                        warning() << "Audit system will retry this write another " << retries - 1 << " times." << std::endl;
-                        if (retries <= 7 && retries > 0) {
-                            sleepmillis(1 << ((7 - retries) * 2));
-                        }
-                    }
-
-                    if (writeRet != 0) {
+                int writeRet;
+                for (int retries = 10; retries > 0; --retries) {
+                    writeRet = _file->writeReturningError(pos, str.c_str(), str.size());
+                    if (writeRet == 0) {
+                        break;
+                    } else if (!ioErrorShouldRetry(writeRet)) {
                         error() << "Audit system cannot write event " << obj.str() << " to log file " << _fileName << std::endl;
                         error() << "Write failed with fatal error " << errnoWithDescription(writeRet) << std::endl;
                         error() << "As audit cannot make progress, the server will now shut down." << std::endl;
                         realexit(EXIT_AUDIT_ERROR);
                     }
+                    warning() << "Audit system cannot write event " << obj.str() << " to log file " << _fileName << std::endl;
+                    warning() << "Write failed with retryable error " << errnoWithDescription(writeRet) << std::endl;
+                    warning() << "Audit system will retry this write another " << retries - 1 << " times." << std::endl;
+                    if (retries <= 7 && retries > 0) {
+                        sleepmillis(1 << ((7 - retries) * 2));
+                    }
+                }
+
+                if (writeRet != 0) {
+                    error() << "Audit system cannot write event " << obj.str() << " to log file " << _fileName << std::endl;
+                    error() << "Write failed with fatal error " << errnoWithDescription(writeRet) << std::endl;
+                    error() << "As audit cannot make progress, the server will now shut down." << std::endl;
+                    realexit(EXIT_AUDIT_ERROR);
                 }
 
                 int fsyncRet;
