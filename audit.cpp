@@ -10,6 +10,7 @@
 
 #include <boost/filesystem/path.hpp>
 
+#include "mongo/base/init.h"
 #include "mongo/bson/bson_field.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -50,6 +51,13 @@ namespace audit {
             path(""),
             destination("file"),
             filter("{}") {
+        }
+
+        BSONObj toBSON() {
+            return BSON("format" << format <<
+                        "path" << path <<
+                        "destination" << destination <<
+                        "filter" << filter);
         }
 
         Status initializeFromCommandLine() {
@@ -538,7 +546,7 @@ namespace audit {
             return;
         }
 
-        const BSONObj params = BSON("old" << oldConfig << "new" << newConfig);
+        const BSONObj params = BSON("old" << *oldConfig << "new" << *newConfig);
         _auditEvent(client, "replSetReconfig", params);
     }
 
@@ -702,7 +710,7 @@ namespace audit {
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {
             ActionSet actions;
-            actions.addAction(ActionType::logReplInfo);
+            actions.addAction(ActionType::logApplicationMessage);
             out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
         }
         bool run(const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
@@ -719,5 +727,32 @@ namespace audit {
             return ok;
         }
     } cmdLogApplicationMessage;
+
+    class AuditGetOptionsCommand : public QueryCommand {
+    public:
+        AuditGetOptionsCommand() : QueryCommand("auditGetOptions") { }
+        virtual ~AuditGetOptionsCommand() { }
+        virtual void help( stringstream &help ) const {
+            help << 
+                "Get the options the audit system is currently using"
+                "Example: { auditGetOptions: 1 }";
+        }
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) { }
+        bool run(const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+            result.appendElements(audit::_auditOptions.toBSON());
+            return true;
+        }
+    };
+
+    // so tests can determine where the audit log lives
+    MONGO_INITIALIZER(RegisterAuditGetOptionsCommand)(InitializerContext* context) {
+        if (Command::testCommandsEnabled) {
+            // Leaked intentionally: a Command registers itself when constructed.
+            new AuditGetOptionsCommand();
+        }
+        return Status::OK();
+    }
 
 }  // namespace mongo
