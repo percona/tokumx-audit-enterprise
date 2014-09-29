@@ -349,7 +349,7 @@ namespace audit {
             BSONArrayBuilder users(builder.subarrayStart("users"));
             for (PrincipalSet::NameIterator it = manager->getAuthenticatedPrincipalNames();
                  it.more(); it.next()) {
-                BSONArrayBuilder user(users.subobjStart());
+                BSONObjBuilder user(users.subobjStart());
                 user.append("user", it->getUser());
                 user.append("db", it->getDB());
                 user.doneFast();
