@@ -8,6 +8,8 @@
 #include <iostream>
 #include <string>
 
+#include <boost/filesystem/path.hpp>
+
 #include "mongo/bson/bson_field.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -22,6 +24,7 @@
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/sock.h"
+#include "mongo/util/paths.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -44,7 +47,7 @@ namespace audit {
 
         AuditOptions() :
             format("JSON"),
-            path("auditLog.json"),
+            path(""),
             destination("file"),
             filter("{}") {
         }
@@ -67,6 +70,12 @@ namespace audit {
                                   + cmdLine.auditPath);
                 }
                 path = cmdLine.auditPath;
+            } else if (!cmdLine.logWithSyslog && !cmdLine.logpath.empty()) {
+                path = (boost::filesystem::path(cmdLine.logpath).parent_path() / "auditLog.json").native();
+            } else if (!dbpath.empty()) {
+                path = (boost::filesystem::path(dbpath) / "auditLog.json").native();
+            } else {
+                path = (boost::filesystem::path(cmdLine.cwd) / "auditLog.json").native();
             }
 
             if (cmdLine.auditDestination != "") {
