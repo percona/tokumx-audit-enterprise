@@ -2,7 +2,11 @@
  *    Copyright (C) 2014 Tokutek Inc.
  */
 
+#include "mongo/pch.h"
+
 #include <cstdio>
+#include <iostream>
+#include <string>
 
 #include "mongo/bson/bson_field.h"
 #include "mongo/db/audit.h"
@@ -12,10 +16,11 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher.h"
 #include "mongo/db/namespacestring.h"
-#include "mongo/util/concurrency/rwlock.h"
-#include "mongo/util/concurrency/simplerwlock.h"
+#include "mongo/util/concurrency/mutex.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/file.h"
 #include "mongo/util/log.h"
+#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/time_support.h"
 
@@ -87,37 +92,127 @@ namespace audit {
         }
     } _auditOptions;
 
+    NOINLINE_DECL void realexit( ExitCode rc ) {
+#ifdef _COVERAGE
+        // Need to make sure coverage data is properly flushed before exit.
+        // It appears that ::_exit() does not do this.
+        log() << "calling regular ::exit() so coverage data may flush..." << endl;
+        ::exit( rc );
+#else
+        ::_exit( rc );
+#endif
+    }
+
     // Writable interface for audit events
     class WritableAuditLog : public AuditLog {
     public:
-        virtual ~WritableAuditLog() {};
+        virtual ~WritableAuditLog() {}
         virtual void append(const BSONObj &obj) = 0;
         virtual void rotate() = 0;
     };
 
     // Writes audit events to a json file
     class JSONAuditLog : public WritableAuditLog {
+        bool ioErrorShouldRetry(int errcode) {
+            return (errcode == EAGAIN ||
+                    errcode == EWOULDBLOCK ||
+                    errcode == EINTR);
+        }
+
     public:
         JSONAuditLog(const std::string &file, const BSONObj &filter)
             : _file(new File), 
               _matcher(filter.getOwned()), 
               _fileName(file),
-              _rwLock("auditfileRWLock") {
+              _mutex("auditFileMutex") {
             _file->open(file.c_str(), false, false);
-        };
+        }
 
         virtual void append(const BSONObj &obj) {
             if (_matcher.matches(obj)) {
-                const std::string str = obj.str();
-                SimpleRWLock::Shared lck(_rwLock);
-                _file->write(_file->len(), str.c_str(), str.size());
-                _file->write(_file->len(), "\n", 1);
-                _file->fsync();
+                const std::string str = mongoutils::str::stream() << obj.str() << "\n";
+
+                // mongo::File does not have an "atomic append" operation.
+                // As such, with a rwlock we are vulnerable to a race
+                // where we get the length of the file, then try to pwrite
+                // at that offset.  If another write beats us to pwrite,
+                // we'll overwrite that audit data when our write goes
+                // through.
+                //
+                // Somewhere, we need a mutex around grabbing the file
+                // offset and trying to write to it (even if this were in
+                // the kernel, the synchronization is still there).  This
+                // is a good enough place as any.
+                //
+                // Note that we don't need the mutex around fsync.
+                {
+                    SimpleMutex::scoped_lock lck(_mutex);
+
+                    // If pwrite performs a partial write, we don't want to
+                    // muck about figuring out how much it did write (hard to
+                    // get out of the File abstraction) and then carefully
+                    // writing the rest.  Easier to calculate the position
+                    // first, then repeatedly write to that position if we
+                    // have to retry.
+                    fileofs pos = _file->len();
+
+                    int writeRet;
+                    for (int retries = 10; retries > 0; --retries) {
+                        writeRet = _file->writeReturningError(pos, str.c_str(), str.size());
+                        if (writeRet == 0) {
+                            break;
+                        } else if (!ioErrorShouldRetry(writeRet)) {
+                            error() << "Audit system cannot write event " << obj.str() << " to log file " << _fileName << std::endl;
+                            error() << "Write failed with fatal error " << errnoWithDescription(writeRet) << std::endl;
+                            error() << "As audit cannot make progress, the server will now shut down." << std::endl;
+                            realexit(EXIT_AUDIT_ERROR);
+                        }
+                        warning() << "Audit system cannot write event " << obj.str() << " to log file " << _fileName << std::endl;
+                        warning() << "Write failed with retryable error " << errnoWithDescription(writeRet) << std::endl;
+                        warning() << "Audit system will retry this write another " << retries - 1 << " times." << std::endl;
+                        if (retries <= 7 && retries > 0) {
+                            sleepmillis(1 << ((7 - retries) * 2));
+                        }
+                    }
+
+                    if (writeRet != 0) {
+                        error() << "Audit system cannot write event " << obj.str() << " to log file " << _fileName << std::endl;
+                        error() << "Write failed with fatal error " << errnoWithDescription(writeRet) << std::endl;
+                        error() << "As audit cannot make progress, the server will now shut down." << std::endl;
+                        realexit(EXIT_AUDIT_ERROR);
+                    }
+                }
+
+                int fsyncRet;
+                for (int retries = 10; retries > 0; --retries) {
+                    fsyncRet = _file->fsyncReturningError();
+                    if (fsyncRet == 0) {
+                        break;
+                    } else if (!ioErrorShouldRetry(fsyncRet)) {
+                        error() << "Audit system cannot fsync event " << obj.str() << " to log file " << _fileName << std::endl;
+                        error() << "Fsync failed with fatal error " << errnoWithDescription(fsyncRet) << std::endl;
+                        error() << "As audit cannot make progress, the server will now shut down." << std::endl;
+                        realexit(EXIT_AUDIT_ERROR);
+                    }
+                    warning() << "Audit system cannot fsync event " << obj.str() << " to log file " << _fileName << std::endl;
+                    warning() << "Fsync failed with retryable error " << errnoWithDescription(fsyncRet) << std::endl;
+                    warning() << "Audit system will retry this fsync another " << retries - 1 << " times." << std::endl;
+                    if (retries <= 7 && retries > 0) {
+                        sleepmillis(1 << ((7 - retries) * 2));
+                    }
+                }
+
+                if (fsyncRet != 0) {
+                    error() << "Audit system cannot fsync event " << obj.str() << " to log file " << _fileName << std::endl;
+                    error() << "Fsync failed with fatal error " << errnoWithDescription(fsyncRet) << std::endl;
+                    error() << "As audit cannot make progress, the server will now shut down." << std::endl;
+                    realexit(EXIT_AUDIT_ERROR);
+                }
             }
-        };
+        }
 
         virtual void rotate() {
-            SimpleRWLock::Exclusive lck(_rwLock);
+            SimpleMutex::scoped_lock lck(_mutex);
 
             // Close the current file.
             _file.reset();
@@ -143,13 +238,13 @@ namespace audit {
         scoped_ptr<File> _file;
         const Matcher _matcher;
         const std::string _fileName;
-        SimpleRWLock _rwLock;
+        SimpleMutex _mutex;
     };
 
-    // Opens an audit log writes to the void - no logging action is taken
-    // other than doing a simple sanity check on the obj to see that it
-    // is non-empty and iterable.
-    // empty and is iterable.
+    // A void audit log does not actually write any audit events. Instead, it
+    // verifies that we can call toString() on the generatd bson obj and that
+    // the result is non-empty. This is useful for sanity testing the audit bson
+    // generation code even when auditing is not explicitly enabled in debug builds.
     class VoidAuditLog : public WritableAuditLog {
     public:
         void append(const BSONObj &obj) {
@@ -237,7 +332,10 @@ namespace audit {
             BSONArrayBuilder users(builder.subarrayStart("users"));
             for (PrincipalSet::NameIterator it = manager->getAuthenticatedPrincipalNames();
                  it.more(); it.next()) {
-                users.append(BSON("user" << it->getUser() << "db" << it->getDB()));
+                BSONArrayBuilder user(users.subobjStart());
+                user.append("user", it->getUser());
+                user.append("db", it->getDB());
+                user.doneFast();
             }
             users.doneFast();
         } else {
